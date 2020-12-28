@@ -36,6 +36,9 @@ def make_targets(pred_boxes, target, best_ns, s, num_classes, nH, nW, sil_thresh
     mask = torch.zeros([nB, nH, nW], dtype=torch.uint8)
     tx = torch.zeros(nB, nH, nW)
     ty = torch.zeros(nB, nH, nW)
+    tw = torch.zeros(nB, nH, nW)
+    th = torch.zeros(nB, nH, nW)
+    tangle = torch.zeros(nB, nH, nW)
     tconf = torch.zeros(nB, nH, nW)
     nCorrect = 0
     for b in range(nB):
@@ -54,6 +57,9 @@ def make_targets(pred_boxes, target, best_ns, s, num_classes, nH, nW, sil_thresh
             mask[b][gj][gi] = 1
             tx[b][gj][gi] = gx - gi
             ty[b][gj][gi] = gy - gj
+            tw[b][gj][gi] = target[b][t][2]
+            th[b][gj][gi] = target[b][t][3]
+            tangle[b][gj][gi] = target[b][t][4]
 
             iou = bbox_iou(gt_box, pred_box.data, nW, nH)  # best_iou
             tconf[b][gj][gi] = iou
@@ -61,7 +67,7 @@ def make_targets(pred_boxes, target, best_ns, s, num_classes, nH, nW, sil_thresh
             if pred_box[2] > sil_thresh:
                 nCorrect = nCorrect + 1
 
-    return nCorrect, mask, tx, ty, tconf
+    return nCorrect, mask, tx, ty, tconf, tw, th, tangle
 
 def YoloLoss(outputs, target, num_classes, seen, device):
     out_channels = (6 + num_classes) * 3
@@ -86,15 +92,15 @@ def YoloLoss(outputs, target, num_classes, seen, device):
     for s in range(len(outputs)):
         nH = outputs[s].size(2)
         nW = outputs[s].size(3)
-        print(outputs[s].shape)
-        output = outputs[s].view(nB, out_channels, nH, nW).permute(0, 2, 3, 1).contiguous()
+        output = outputs[s].permute(0, 2, 3, 1).contiguous()
+        # output = outputs[s].view(nB, out_channels, nH, nW).permute(0, 2, 3, 1).contiguous()
           # Get outputs
         x = torch.sigmoid(output[..., 0])  # Center x
         y = torch.sigmoid(output[..., 1])  # Center y
         w = torch.sigmoid(output[..., 2])  #
         h = torch.sigmoid(output[..., 3])  #
         angle = torch.sigmoid(output[..., 4])  #
-        conf = torch.sigmoid(output[..., -1])  # Conf
+        conf = torch.sigmoid(output[..., 5])  # Conf
 
         pred_boxes = torch.FloatTensor(3, nB, nH, nW).to(device)
         grid_x = torch.linspace(0, nW - 1, nW).repeat(nH, 1).repeat(nB, 1, 1).view(nB, nH, nW).to(device)
@@ -106,44 +112,50 @@ def YoloLoss(outputs, target, num_classes, seen, device):
         pred_boxes[2] = conf.data
         pred_boxes = pred_boxes.permute(1, 2, 3, 0).contiguous().cpu()
 
-        nCorrect[s], mask, tx, ty, tconf = \
+        nCorrect, mask, tx, ty, tconf, tw, th, tangle = \
             make_targets(pred_boxes, target.data, best_n, s, nC, nH, nW, thresh)
 
         nProposals[s] = torch.sum(conf > 0.5).item()
-        # print(conf.shape, conf)
 
         tx = tx.to(device)
         ty = ty.to(device)
+        tangle= tangle.to(device)
+        tw = tw.to(device)
+        th = th.to(device)
         tconf = tconf.to(device)
         mask = mask.to(device)
         if len(tconf[mask == 1]) != 0:
             loss_x = coord_scale * nn.MSELoss(reduction='sum')(torch.exp(x[mask == 1]), torch.exp(tx[mask == 1]))
             loss_y = coord_scale * nn.MSELoss(reduction='sum')(torch.exp(y[mask == 1]), torch.exp(ty[mask == 1]))
-            loss_angle = coord_scale * nn.MSELoss(reduction='sum')(torch.exp(y[mask == 1]), torch.exp(ty[mask == 1]))
+            loss_w = coord_scale * nn.MSELoss(reduction='sum')(torch.exp(w[mask == 1]), torch.exp(tw[mask == 1]))
+            loss_h = coord_scale * nn.MSELoss(reduction='sum')(torch.exp(h[mask == 1]), torch.exp(th[mask == 1]))
+            loss_angle = coord_scale * nn.MSELoss(reduction='sum')(torch.exp(angle[mask == 1]), torch.exp(tangle[mask == 1]))
             loss_conf = object_scale * nn.MSELoss(reduction='sum')(conf[mask == 1], tconf[mask == 1]) + \
                         noobject_scale * nn.MSELoss(reduction='sum')(conf[mask == 0], tconf[mask == 0])
 
 
-            loss_tot = loss_x + loss_y + loss_angle + loss_angle+loss_conf
+            loss_tot = loss_x + loss_y + loss_angle + loss_angle+loss_conf+loss_w+loss_h
             loss.append(loss_tot)
             print('%d: nGT: %d, recall: %d, proposals: %d, loss: x %f, y %f, angle %f, conf %f, total %f' % (
-                seen, nGT, nCorrect[s], nProposals[s], loss_x.item(), loss_y.item(),  loss_angle.item(), loss_conf.item(), loss[s].item()))
+                seen, nGT, nCorrect, nProposals[s], loss_x.item(), loss_y.item(),  loss_angle.item(), loss_conf.item(), loss[s].item()))
         else:
             loss_tot = noobject_scale * nn.MSELoss(reduction='sum')(conf[mask == 0], tconf[mask == 0])
             loss.append(loss_tot)
             print('%d: nGT: %d, recall: %d, proposals: %d, loss: noobj %f' % (
-                seen, nGT, nCorrect[s], nProposals[s], loss[s].item()))
+                seen, nGT, nCorrect, nProposals[s], loss[s].item()))
 
     return loss, nGT, nCorrect, nProposals
 
 def test():
-    output0 = torch.randn(1, 3, 12, 12)
-    output1 = torch.randn(1, 3, 24, 24)
-    output2 = torch.randn(1, 3, 48, 48)
+
+    output0 = torch.randn(1, 21, 100, 56)
+    output1 = torch.randn(1, 21, 50, 28)
+    output2 = torch.randn(1, 21, 25, 14)
+
+
     target = torch.tensor([0.54,0.51]).float()
     target = target[None, None,:]
     Outputs = [output0, output1, output2]
-    loss, nGT, nCorrect, nProposals = YoloLoss(Outputs, target, 1,
-                                               1, 'cpu')
+    loss, nGT, nCorrect, nProposals = YoloLoss(Outputs, target, 1, 1, 'cpu')
 
 # test()
